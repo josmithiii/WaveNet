@@ -8,15 +8,18 @@ import torch
 import torch.optim
 
 from wavenet.networks import WaveNet as WaveNetModule
+import numpy as np
+from wavenet.utils.audio import vector_to_audio
 
 
 class WaveNet:
-    def __init__(self, layer_size, stack_size, in_channels, res_channels, lr=0.002):
+    def __init__(self, layer_size, stack_size, in_channels, res_channels, output_dim=None, lr=0.002):
 
-        self.net = WaveNetModule(layer_size, stack_size, in_channels, res_channels)
+        self.net = WaveNetModule(layer_size, stack_size, in_channels, res_channels, output_dim)
 
         self.in_channels = in_channels
         self.receptive_fields = self.net.receptive_fields
+        self.is_classifier = output_dim is not None
 
         self.lr = lr
         self.loss = self._loss()
@@ -24,14 +27,31 @@ class WaveNet:
 
         self._prepare_for_gpu()
 
-    @staticmethod
-    def _loss():
-        loss = torch.nn.CrossEntropyLoss()
+    def _loss(self):
+        if self.is_classifier:
+            def classifier_loss(pred, target):
+                # pred: network output vector [batch, output_dim]
+                # target: ground truth audio [batch, timestep, channels]
 
-        if torch.cuda.is_available():
-            loss = loss.cuda()
+                # Convert prediction vectors to audio using external function
+                pred_audio = torch.stack([
+                    torch.from_numpy(vector_to_audio(p.cpu().numpy())).to(pred.device)
+                    for p in pred
+                ])
 
-        return loss
+                # Ensure pred_audio matches target shape
+                assert pred_audio.shape == target.shape, \
+                    f"Shape mismatch: pred_audio {pred_audio.shape} != target {target.shape}"
+
+                # Apply MSE loss
+                return torch.nn.functional.mse_loss(pred_audio, target)
+
+            return classifier_loss
+        else:
+            loss = torch.nn.CrossEntropyLoss()
+            if torch.cuda.is_available():
+                loss = loss.cuda()
+            return loss
 
     def _optimizer(self):
         return torch.optim.Adam(self.net.parameters(), lr=self.lr)
@@ -48,13 +68,17 @@ class WaveNet:
         """
         Train 1 time
         :param inputs: Tensor[batch, timestep, channels]
-        :param targets: Torch tensor [batch, timestep, channels]
+        :param targets: If classifier: Same as inputs
+                       Otherwise: Torch tensor [batch, timestep, channels]
         :return: float loss
         """
         outputs = self.net(inputs)
 
-        loss = self.loss(outputs.view(-1, self.in_channels),
-                         targets.long().view(-1))
+        if self.is_classifier:
+            loss = self.loss(outputs, inputs)  # Compare with input signal
+        else:
+            loss = self.loss(outputs.view(-1, self.in_channels),
+                            targets.long().view(-1))
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -66,10 +90,10 @@ class WaveNet:
         """
         Generate 1 time
         :param inputs: Tensor[batch, timestep, channels]
-        :return: Tensor[batch, timestep, channels]
+        :return: If classifier: Tensor[batch, output_dim]
+                Otherwise: Tensor[batch, timestep, channels]
         """
         outputs = self.net(inputs)
-
         return outputs
 
     @staticmethod
@@ -100,4 +124,3 @@ class WaveNet:
         model_path = self.get_model_path(model_dir, step)
 
         torch.save(self.net.state_dict(), model_path)
-

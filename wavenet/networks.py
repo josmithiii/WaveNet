@@ -30,6 +30,13 @@ class DilatedCausalConv1d(torch.nn.Module):
                 m.weight.data.fill_(1)
 
     def forward(self, x):
+        """
+        Note that timesteps must exceed the receptive field of the network
+        :param x: Tensor[batch, timesteps, channels]
+        :return: If classifier: Tensor[batch, output_dim]
+                 Otherwise: Tensor[batch, timesteps, channels]
+        :raises InputSizeError: In non-classifier mode, if input length < receptive field
+        """
         output = self.conv(x)
 
         return output
@@ -58,7 +65,7 @@ class CausalConv1d(torch.nn.Module):
 
 
 class ResidualBlock(torch.nn.Module):
-    def __init__(self, res_channels, skip_channels, dilation):
+    def __init__(self, res_channels, skip_channels, dilation, is_classifier=False):
         """
         Residual block
         :param res_channels: number of residual channel for input, output
@@ -67,7 +74,12 @@ class ResidualBlock(torch.nn.Module):
         """
         super(ResidualBlock, self).__init__()
 
-        self.dilated = DilatedCausalConv1d(res_channels, dilation=dilation)
+        if is_classifier:
+            self.dilated = torch.nn.Conv1d(res_channels, res_channels,
+                                         kernel_size=2, dilation=dilation,
+                                         padding=dilation)  # Use standard padding
+        else:
+            self.dilated = DilatedCausalConv1d(res_channels, dilation=dilation)
         self.conv_res = torch.nn.Conv1d(res_channels, res_channels, 1)
         self.conv_skip = torch.nn.Conv1d(res_channels, skip_channels, 1)
 
@@ -197,24 +209,36 @@ class DensNet(torch.nn.Module):
 
 
 class WaveNet(torch.nn.Module):
-    def __init__(self, layer_size, stack_size, in_channels, res_channels):
+    def __init__(self, layer_size, stack_size, in_channels, res_channels, output_dim=None):
         """
         Stack residual blocks by layer and stack size
         :param layer_size: integer, 10 = layer[dilation=1, dilation=2, 4, 8, 16, 32, 64, 128, 256, 512]
         :param stack_size: integer, 5 = stack[layer1, layer2, layer3, layer4, layer5]
         :param in_channels: number of channels for input data. skip channel is same as input channel
         :param res_channels: number of residual channel for input, output
+        :param output_dim: if set, converts to classifier mode outputting a vector of this size
         :return:
         """
         super(WaveNet, self).__init__()
 
         self.receptive_fields = self.calc_receptive_fields(layer_size, stack_size)
+        self.is_classifier = output_dim is not None
 
         self.causal = CausalConv1d(in_channels, res_channels)
-
         self.res_stack = ResidualStack(layer_size, stack_size, res_channels, in_channels)
 
-        self.densnet = DensNet(in_channels)
+        if self.is_classifier:
+            self.output_layer = torch.nn.Sequential(
+                torch.nn.Conv1d(in_channels, in_channels, 1),
+                torch.nn.BatchNorm1d(in_channels),
+                torch.nn.ReLU(),
+                torch.nn.AdaptiveAvgPool1d(1),
+                torch.nn.Flatten(),
+                torch.nn.Dropout(0.5),
+                torch.nn.Linear(in_channels, output_dim)
+            )
+        else:
+            self.densnet = DensNet(in_channels)
 
     @staticmethod
     def calc_receptive_fields(layer_size, stack_size):
@@ -236,21 +260,54 @@ class WaveNet(torch.nn.Module):
 
     def forward(self, x):
         """
-        The size of timestep(3rd dimention) has to be bigger than receptive fields
+        Note that timestep must exceed the receptive field of the network
         :param x: Tensor[batch, timestep, channels]
-        :return: Tensor[batch, timestep, channels]
+        :return: If classifier: Tensor[batch, output_dim]
+                Otherwise: Tensor[batch, timestep, channels]
         """
         output = x.transpose(1, 2)
 
-        output_size = self.calc_output_size(output)
+        if not self.is_classifier:
+            output_size = self.calc_output_size(output)
+            self.check_input_size(output, output_size)
 
         output = self.causal(output)
-
-        skip_connections = self.res_stack(output, output_size)
-
+        skip_connections = self.res_stack(output,
+                                        output_size if not self.is_classifier else output.size(2))
         output = torch.sum(skip_connections, dim=0)
 
-        output = self.densnet(output)
+        if self.is_classifier:
+            return self.output_layer(output)
+        else:
+            output = self.densnet(output)
+            return output.transpose(1, 2).contiguous()
 
-        return output.transpose(1, 2).contiguous()
+# By Claude 3.5 Sonnet 2024-11-18, in Cursor on this project:
+# NO LONGER USED, but keeping it here for reference:
+class WaveNetClassifier(torch.nn.Module):
+    def __init__(self, layer_size, stack_size, in_channels, res_channels, output_dim=16):
+        super(WaveNetClassifier, self).__init__()
 
+        # Replace causal conv with regular conv
+        self.initial_conv = torch.nn.Conv1d(in_channels, res_channels, 1)
+
+        # Keep residual blocks but without causality
+        self.res_stack = ResidualStack(layer_size, stack_size, res_channels, res_channels)
+
+        # Replace DensNet with classifier head
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Conv1d(res_channels, res_channels, 1),
+            torch.nn.ReLU(),
+            torch.nn.AdaptiveAvgPool1d(1),  # Global average pooling
+            torch.nn.Flatten(),
+            torch.nn.Linear(res_channels, output_dim)
+        )
+
+    def forward(self, x):
+        x = x.transpose(1, 2)  # [batch, timestep, channels] -> [batch, channels, timestep]
+
+        x = self.initial_conv(x)
+        skip_connections = self.res_stack(x, x.size(2))
+        x = torch.sum(skip_connections, dim=0)
+
+        return self.classifier(x)

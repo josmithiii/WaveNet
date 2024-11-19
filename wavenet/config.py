@@ -16,6 +16,10 @@ parser.add_argument('--res_channels', type=int, default=512, help='number of cha
 parser.add_argument('--sample_rate', type=int, default=16000, help='Sampling rates for input sound')
 parser.add_argument('--sample_size', type=int, default=100000, help='Sample size for training input')
 
+# By Claude 3.5 Sonnet 2024-11-18, in Cursor on this project:
+parser.add_argument('--output_dim', type=int, default=None,
+                    help='If set, converts WaveNet to classifier outputting vectors of this size')
+
 
 def parse_args(is_training=True):
     if is_training:
